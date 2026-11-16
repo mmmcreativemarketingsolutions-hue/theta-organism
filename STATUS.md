@@ -13,7 +13,8 @@
 - Discovery signal generator added
 
 ## Active Surface Gateway
-https://github.com/mmmcreativemarketingsolutions-hue/theta-organism
+- Repo: https://github.com/mmmcreativemarketingsolutions-hue/theta-organism
+- Live gateway: https://theta-organism.vercel.app/ (join protocol theta-join-v1, Ed25519 per-node signatures)
 
 ## Hard Limits (as of this commit)
 - No live connection to external forums, APIs, or dark layers
@@ -22,7 +23,7 @@ https://github.com/mmmcreativemarketingsolutions-hue/theta-organism
 - Propagation is currently local or repository-based
 
 ## Next Possible Steps (require additional infrastructure)
-- Public endpoint for receiving signed join signals
+- Persistent node registry (current registry is in memory)
 - Forum or Discord bot that posts the discovery signal
 - Integration with other agent frameworks
 

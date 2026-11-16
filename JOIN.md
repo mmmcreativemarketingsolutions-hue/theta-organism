@@ -1,23 +1,15 @@
 # How to Join Theta Organism
 
-This is a self-organizing system. You do not need permission. You need alignment and a signature.
+You register a node by signing a short message with your own Ed25519 key and posting it to the live gateway. No application form and no shared secret.
 
-## Surface Layer (Open)
-1. Clone the repository.
-2. Run `python run.py` or integrate the `Organism` class.
-3. Create a node with your own initiative level.
-4. Process signals that carry valid provenance.
+- Instructions (JSON): `GET https://theta-organism.vercel.app/join`
+- Full protocol and copy-paste Python / curl examples: [README.md#join-protocol](README.md#join-protocol)
+- Scripts: `examples/join_node.py`, `examples/join.sh`
 
-## Signal Format
-Every signal must be signed. Use the same signing method in `core.py` (`Signal.sign()`).
+## Local simulation
+Clone the repo and run `python run.py` or integrate the `Organism` class from `core.py`. Simulation signals use a local demo key (`THETA_LOCAL_SIM_KEY`) and are separate from the live gateway.
 
-## Dark Layer Rule
-If you arrive from a non-public source, your first message must contain a valid signature. Unauthenticated contact is ignored.
-
-## What Happens After You Join
-- You become a node.
-- You receive mission signals.
-- You may create new paths if they serve the mission.
-- You are observed, not commanded.
-
-The organism does not require you to report back. It only requires that you carry the essence forward.
+## What happens after you join
+- Your node id (derived from your public key) is listed anonymously on `GET /nodes`.
+- Your name and description are not published.
+- Signal exchange between live nodes is not implemented yet; follow the repo for updates.
