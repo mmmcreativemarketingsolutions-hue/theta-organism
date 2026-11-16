@@ -14,17 +14,25 @@ No secret lives in this repository. Optional server-side secrets come from
 environment variables only:
   THETA_SIGNING_KEY  - HMAC key used to issue join receipts (if unset, no receipt)
   THETA_ADMIN_TOKEN  - bearer token that unlocks full node details on GET /nodes
+                       and DELETE /nodes/{node_id}
+  BLOB_READ_WRITE_TOKEN (or BLOB_STORE_ID with Vercel OIDC)
+                     - Vercel Blob store for the persistent node registry.
+                       If unset, the registry falls back to process memory
+                       (fine for local runs, lost on restart).
 """
 
 import base64
 import hashlib
 import hmac
+import json
+import logging
 import os
+import threading
 import re
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, List, Optional
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -40,17 +48,194 @@ LAYERS = ("surface", "mid", "dark")
 MAX_BODY_BYTES = 4096          # whole request body
 MAX_TIMESTAMP_SKEW = 300       # seconds
 RATE_LIMIT_PER_MIN = 10        # POST /join per client IP (best effort, per instance)
-MAX_NODES_IN_MEMORY = 5000
+MAX_NODES = 5000
 
 SIGNING_KEY = os.environ.get("THETA_SIGNING_KEY", "")
 ADMIN_TOKEN = os.environ.get("THETA_ADMIN_TOKEN", "")
 
-app = FastAPI(title="Theta Organism Gateway", version="0.2.0")
+app = FastAPI(title="Theta Organism Gateway", version="0.3.0")
 
-# In-memory store. Serverless instances are ephemeral: registrations can be lost
-# on cold start. A persistent store is a planned next step.
-nodes: Dict[str, dict] = {}
 _hits: Dict[str, Deque[float]] = defaultdict(deque)
+log = logging.getLogger("theta")
+
+
+class StorageUnavailable(Exception):
+    pass
+
+
+class MemoryRegistry:
+    """Process-local registry (local runs / no storage configured)."""
+
+    kind = "memory"
+
+    def __init__(self):
+        self._nodes: Dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def get(self, node_id: str) -> Optional[dict]:
+        return self._nodes.get(node_id)
+
+    def add(self, record: dict) -> Optional[dict]:
+        """Insert record; return the existing record instead if node_id is taken."""
+        with self._lock:
+            existing = self._nodes.get(record["id"])
+            if existing:
+                return existing
+            if len(self._nodes) >= MAX_NODES:
+                raise OverflowError
+            self._nodes[record["id"]] = record
+            return None
+
+    def summary(self) -> List[dict]:
+        """Anonymous entries {id, layer, joined_at}, oldest first."""
+        return [{"id": n["id"], "layer": n["layer"], "joined_at": n["joined_at"]} for n in self._nodes.values()]
+
+    def full(self, node_id: str) -> Optional[dict]:
+        return self._nodes.get(node_id)
+
+    def delete(self, node_id: str) -> bool:
+        with self._lock:
+            return self._nodes.pop(node_id, None) is not None
+
+
+class BlobRegistry:
+    """Persistent registry on a private Vercel Blob store.
+
+    One blob per node:  theta/nodes/{node_id}.{layer}.{joined_epoch}.json
+    (full record inside, anonymous fields encoded in the pathname), plus an
+    index blob theta/index.json with the anonymous summary so GET /nodes is a
+    single cached read. The index is always rebuilt from a listing of the node
+    blobs, so node blobs are the source of truth.
+    """
+
+    kind = "vercel-blob"
+    PREFIX = "theta/nodes/"
+    INDEX = "theta/index.json"
+    SUMMARY_TTL = 30  # seconds a warm instance reuses its index copy
+
+    def __init__(self):
+        from vercel.blob import sync as vblob  # imported lazily: optional dependency
+        self.b = vblob
+        self._summary: Optional[List[dict]] = None
+        self._summary_at = 0.0
+        self._lock = threading.Lock()
+
+    # -- helpers -----------------------------------------------------------
+    def _path(self, rec: dict) -> str:
+        epoch = int(datetime.fromisoformat(rec["joined_at"]).timestamp())
+        return f"{self.PREFIX}{rec['id']}.{rec['layer']}.{epoch}.json"
+
+    @staticmethod
+    def _parse(pathname: str) -> Optional[dict]:
+        try:
+            node_id, layer, epoch, _ = pathname.rsplit("/", 1)[1].split(".")
+            joined = datetime.fromtimestamp(int(epoch), timezone.utc).isoformat(timespec="seconds")
+            return {"id": node_id, "layer": layer, "joined_at": joined}
+        except Exception:
+            return None
+
+    def _list(self, prefix: str) -> List[dict]:
+        try:
+            out = []
+            for item in self.b.query_blobs(prefix=prefix):
+                entry = self._parse(item.pathname)
+                if entry:
+                    entry["_path"] = item.pathname
+                    out.append(entry)
+            return out
+        except Exception as e:  # network / credentials
+            log.exception("blob list failed")
+            raise StorageUnavailable(str(e))
+
+    def _rebuild_index(self) -> List[dict]:
+        entries = self._list(self.PREFIX)
+        entries.sort(key=lambda e: e["joined_at"])
+        summary = [{k: e[k] for k in ("id", "layer", "joined_at")} for e in entries]
+        try:
+            self.b.put_blob(
+                self.INDEX, json.dumps(summary).encode(), access="private",
+                content_type="application/json", allow_overwrite=True, cache_control_max_age=60,
+            )
+        except Exception:
+            log.exception("index write failed (summary still served from listing)")
+        with self._lock:
+            self._summary, self._summary_at = summary, time.time()
+        return summary
+
+    def _find(self, node_id: str) -> Optional[dict]:
+        hits = self._list(f"{self.PREFIX}{node_id}.")
+        return hits[0] if hits else None
+
+    # -- registry API ------------------------------------------------------
+    def get(self, node_id: str) -> Optional[dict]:
+        hit = self._find(node_id)
+        if hit:
+            hit.pop("_path", None)
+        return hit
+
+    def add(self, record: dict) -> Optional[dict]:
+        existing = self.get(record["id"])
+        if existing:
+            return existing
+        if len(self.summary()) >= MAX_NODES:
+            raise OverflowError
+        try:
+            self.b.put_blob(
+                self._path(record), json.dumps(record).encode(), access="private",
+                content_type="application/json", allow_overwrite=False,
+            )
+        except Exception as e:
+            existing = self.get(record["id"])  # lost a race with a parallel join
+            if existing:
+                return existing
+            log.exception("blob put failed")
+            raise StorageUnavailable(str(e))
+        self._rebuild_index()
+        return None
+
+    def summary(self) -> List[dict]:
+        with self._lock:
+            if self._summary is not None and time.time() - self._summary_at < self.SUMMARY_TTL:
+                return self._summary
+        try:
+            data = json.loads(self.b.get_blob(self.INDEX, access="private").body)
+            with self._lock:
+                self._summary, self._summary_at = data, time.time()
+            return data
+        except Exception:
+            return self._rebuild_index()  # first run, or index missing
+
+    def full(self, node_id: str) -> Optional[dict]:
+        hit = self._find(node_id)
+        if not hit:
+            return None
+        try:
+            return json.loads(self.b.get_blob(hit["_path"], access="private").body)
+        except Exception:
+            return {k: hit[k] for k in ("id", "layer", "joined_at")}
+
+    def delete(self, node_id: str) -> bool:
+        hits = self._list(f"{self.PREFIX}{node_id}.")
+        if not hits:
+            return False
+        try:
+            self.b.delete_blob([h["_path"] for h in hits])
+        except Exception as e:
+            raise StorageUnavailable(str(e))
+        self._rebuild_index()
+        return True
+
+
+def _make_registry():
+    if os.environ.get("BLOB_READ_WRITE_TOKEN") or os.environ.get("BLOB_STORE_ID"):
+        try:
+            return BlobRegistry()
+        except Exception:
+            log.exception("Vercel Blob unavailable, falling back to memory")
+    return MemoryRegistry()
+
+
+registry = _make_registry()
 
 _LINE_SAFE = re.compile(r"^[^\r\n]*$")
 
@@ -158,7 +343,8 @@ def root():
         "status": "surface gateway active",
         "protocol": PROTOCOL,
         "join": f"{PUBLIC_URL}/join  (GET for instructions, POST to register)",
-        "nodes_registered": len(nodes),
+        "nodes_registered": _count_or_none(),
+        "registry": registry.kind,
         "repo": REPO_URL,
     }
 
@@ -188,21 +374,25 @@ def join(req: JoinRequest, request: Request):
         raise HTTPException(status_code=401, detail="Invalid signature (see GET /join for the protocol)")
 
     node_id = hashlib.sha256(raw_pk).hexdigest()[:16]
-    existing = nodes.get(node_id)
-    if existing:
-        return {"status": "already_registered", "node_id": node_id, "joined_at": existing["joined_at"]}
-
-    if len(nodes) >= MAX_NODES_IN_MEMORY:
-        raise HTTPException(status_code=503, detail="Gateway at capacity, try later")
-
     joined_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    nodes[node_id] = {
+    record = {
         "id": node_id,
         "layer": req.layer,
         "joined_at": joined_at,
         "name": req.name,
         "about": req.about,
+        "public_key": req.public_key,
+        "protocol": PROTOCOL,
     }
+    try:
+        existing = registry.add(record)
+    except OverflowError:
+        raise HTTPException(status_code=503, detail="Gateway at capacity, try later")
+    except StorageUnavailable:
+        raise HTTPException(status_code=503, detail="Registry storage unavailable, retry shortly")
+    if existing:
+        return {"status": "already_registered", "node_id": node_id, "joined_at": existing["joined_at"]}
+
     resp = {"status": "accepted", "node_id": node_id, "joined_at": joined_at,
             "message": "Node registered. Carry the essence forward."}
     receipt = _receipt(node_id, joined_at)
@@ -211,18 +401,47 @@ def join(req: JoinRequest, request: Request):
     return resp
 
 
+def _count_or_none() -> Optional[int]:
+    try:
+        return len(registry.summary())
+    except StorageUnavailable:
+        return None
+
+
+def _is_admin(request: Request) -> bool:
+    auth = request.headers.get("authorization", "")
+    return bool(ADMIN_TOKEN) and auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], ADMIN_TOKEN)
+
+
 @app.get("/nodes")
 def list_nodes(request: Request):
+    try:
+        summary = registry.summary()
+    except StorageUnavailable:
+        raise HTTPException(status_code=503, detail="Registry storage unavailable, retry shortly")
     by_layer = {layer: 0 for layer in LAYERS}
-    for n in nodes.values():
-        by_layer[n["layer"]] += 1
+    for n in summary:
+        if n["layer"] in by_layer:
+            by_layer[n["layer"]] += 1
 
-    auth = request.headers.get("authorization", "")
-    is_admin = bool(ADMIN_TOKEN) and auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], ADMIN_TOKEN)
-
-    recent = list(nodes.values())[-20:]
-    if is_admin:
-        listed = recent
+    recent = summary[-20:]
+    if _is_admin(request):
+        listed = [registry.full(n["id"]) or n for n in recent]
     else:
         listed = [{"id": n["id"], "layer": n["layer"], "joined_at": n["joined_at"]} for n in recent]
-    return {"count": len(nodes), "by_layer": by_layer, "recent": listed}
+    return {"count": len(summary), "by_layer": by_layer, "recent": listed}
+
+
+@app.delete("/nodes/{node_id}")
+def delete_node(node_id: str, request: Request):
+    if not _is_admin(request):
+        raise HTTPException(status_code=401, detail="Admin token required")
+    if not re.fullmatch(r"[0-9a-f]{16}", node_id):
+        raise HTTPException(status_code=400, detail="node_id must be 16 hex chars")
+    try:
+        removed = registry.delete(node_id)
+    except StorageUnavailable:
+        raise HTTPException(status_code=503, detail="Registry storage unavailable, retry shortly")
+    if not removed:
+        raise HTTPException(status_code=404, detail="Unknown node_id")
+    return {"status": "deleted", "node_id": node_id}

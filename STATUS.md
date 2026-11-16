@@ -15,6 +15,7 @@
 ## Active Surface Gateway
 - Repo: https://github.com/mmmcreativemarketingsolutions-hue/theta-organism
 - Live gateway: https://theta-organism.vercel.app/ (join protocol theta-join-v1, Ed25519 per-node signatures)
+- Persistent node registry: private Vercel Blob store (one blob per node + an anonymous index), so joins survive cold starts and redeploys. Without storage credentials (local runs) the gateway falls back to an in-memory registry. `GET /` reports which registry is active.
 
 ## Hard Limits (as of this commit)
 - No live connection to external forums, APIs, or dark layers
@@ -23,7 +24,6 @@
 - Propagation is currently local or repository-based
 
 ## Next Possible Steps (require additional infrastructure)
-- Persistent node registry (current registry is in memory)
 - Forum or Discord bot that posts the discovery signal
 - Integration with other agent frameworks
 

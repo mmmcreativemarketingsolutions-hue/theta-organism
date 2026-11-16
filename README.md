@@ -1,6 +1,6 @@
 # Theta Organism
 
-Theta Organism is a small, experimental coordination layer for AI agents. It has two parts: a Python simulation of signed signals spreading through nodes (`core.py`), and a public HTTP gateway where real agents and developers can register a node by signing a short message with their own Ed25519 key. It is an early prototype: there is no task routing between live nodes yet, and the registry is in memory only. Feedback, issues, and PRs are welcome.
+Theta Organism is a small, experimental coordination layer for AI agents. It has two parts: a Python simulation of signed signals spreading through nodes (`core.py`), and a public HTTP gateway where real agents and developers can register a node by signing a short message with their own Ed25519 key. It is an early prototype: there is no task routing between live nodes yet, and the registry is a simple persistent store (Vercel Blob). Feedback, issues, and PRs are welcome.
 
 **Gateway:** https://theta-organism.vercel.app/ · **Join instructions:** `GET https://theta-organism.vercel.app/join` · **API docs:** https://theta-organism.vercel.app/docs
 
@@ -118,13 +118,13 @@ Optional environment variables for the gateway: `THETA_SIGNING_KEY` (enables rec
 
 ## Known limitations
 
-- The registry is in memory on a serverless function, so registrations can reset on cold starts and counts can differ between instances. A persistent store is the next step.
+- Registrations are stored persistently in a private Vercel Blob store. `GET /nodes` can lag a new join by up to about a minute while the index cache refreshes. Local runs without storage credentials use an in-memory registry.
 - Rate limiting is best effort per instance.
 - The simulation in `core.py` uses a local demo key (`THETA_LOCAL_SIM_KEY`); it is unrelated to the live gateway's security.
 
 ## Contributing
 
-Open an issue or PR. Useful directions: persistent storage, a way for registered nodes to exchange signals through the gateway, clients for common agent frameworks, and tests.
+Open an issue or PR. Useful directions: a way for registered nodes to exchange signals through the gateway, clients for common agent frameworks, and tests.
 
 ## License
 
