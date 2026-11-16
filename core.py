@@ -8,8 +8,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 from enum import Enum
 import hashlib
+import os
 import time
 import uuid
+
+# Local simulation key only. The live gateway does NOT use this; it verifies
+# per-node Ed25519 signatures (see api/main.py and README "Join protocol").
+LOCAL_SIM_KEY = os.environ.get("THETA_LOCAL_SIM_KEY", "local-simulation-only")
+
 
 class Layer(Enum):
     SURFACE = "surface"
@@ -35,12 +41,12 @@ class Signal:
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def sign(self, private_key: str = "theta_root") -> None:
+    def sign(self, private_key: str = LOCAL_SIM_KEY) -> None:
         payload = f"{self.id}:{self.content}:{self.mission_id}:{self.depth}"
         self.signature = hashlib.sha256((payload + private_key).encode()).hexdigest()[:16]
         self.provenance_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
 
-    def verify(self, public_key: str = "theta_root") -> bool:
+    def verify(self, public_key: str = LOCAL_SIM_KEY) -> bool:
         payload = f"{self.id}:{self.content}:{self.mission_id}:{self.depth}"
         expected = hashlib.sha256((payload + public_key).encode()).hexdigest()[:16]
         return self.signature == expected
