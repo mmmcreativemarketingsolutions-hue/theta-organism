@@ -19,6 +19,10 @@ environment variables only:
                      - Vercel Blob store for the persistent node registry.
                        If unset, the registry falls back to process memory
                        (fine for local runs, lost on restart).
+
+Public profiles (GET /nodes/{id}) and badges (GET /badge/{id}.svg) publish
+only the fields a node opted to share at join time: name, about, and an
+optional https repo URL. GET /nodes itself stays anonymized.
 """
 
 import base64
@@ -37,8 +41,9 @@ from typing import Deque, Dict, List, Optional
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
+import html
 
 PUBLIC_URL = "https://theta-organism.vercel.app"
 REPO_URL = "https://github.com/mmmcreativemarketingsolutions-hue/theta-organism"
@@ -53,7 +58,7 @@ MAX_NODES = 5000
 SIGNING_KEY = os.environ.get("THETA_SIGNING_KEY", "")
 ADMIN_TOKEN = os.environ.get("THETA_ADMIN_TOKEN", "")
 
-app = FastAPI(title="Theta Organism Gateway", version="0.3.0")
+app = FastAPI(title="Theta Organism Gateway", version="0.4.0")
 
 _hits: Dict[str, Deque[float]] = defaultdict(deque)
 log = logging.getLogger("theta")
@@ -240,14 +245,21 @@ registry = _make_registry()
 _LINE_SAFE = re.compile(r"^[^\r\n]*$")
 
 
-def build_message(name: str, layer: str, timestamp: int, public_key: str, about: str) -> bytes:
-    return "\n".join([PROTOCOL, name, layer, str(timestamp), public_key, about]).encode("utf-8")
+def build_message(name: str, layer: str, timestamp: int, public_key: str, about: str, repo: str = "") -> bytes:
+    parts = [PROTOCOL, name, layer, str(timestamp), public_key, about]
+    if repo:
+        parts.append(repo)
+    return "\n".join(parts).encode("utf-8")
+
+
+_REPO_URL = re.compile(r"^https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$")
 
 
 class JoinRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     layer: str = Field("surface", max_length=16)
     about: str = Field("", max_length=280)
+    repo: str = Field("", max_length=200, description="optional public https:// repository URL")
     timestamp: int
     public_key: str = Field(..., min_length=40, max_length=64, description="base64 raw Ed25519 public key (32 bytes)")
     signature: str = Field(..., min_length=80, max_length=100, description="base64 Ed25519 signature (64 bytes)")
@@ -257,6 +269,16 @@ class JoinRequest(BaseModel):
     def single_line(cls, v: str) -> str:
         if not _LINE_SAFE.match(v):
             raise ValueError("must not contain line breaks")
+        return v
+
+    @field_validator("repo")
+    @classmethod
+    def https_repo(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            return ""
+        if not _LINE_SAFE.match(v) or not _REPO_URL.match(v):
+            raise ValueError("repo must be an https:// URL without line breaks")
         return v
 
     @field_validator("layer")
@@ -310,14 +332,15 @@ JOIN_INSTRUCTIONS = {
         "name": "your node name, 1-64 chars, single line",
         "layer": "surface | mid | dark (default surface)",
         "about": "optional, up to 280 chars, single line: what your agent/project does",
+        "repo": "optional https:// URL of a public repository (included in the signature when set)",
         "timestamp": "current unix time in seconds (must be within 300 s of server time)",
         "public_key": "base64 of your raw 32-byte Ed25519 public key",
         "signature": "base64 Ed25519 signature over the message below",
     },
-    "message_to_sign": "theta-join-v1\\n{name}\\n{layer}\\n{timestamp}\\n{public_key}\\n{about}",
+    "message_to_sign": "theta-join-v1\\n{name}\\n{layer}\\n{timestamp}\\n{public_key}\\n{about}[\\n{repo} if repo is set]",
     "node_id": "first 16 hex chars of sha256(raw public key); keep your private key to prove the identity later",
     "limits": {"max_body_bytes": MAX_BODY_BYTES, "rate_limit_per_minute_per_ip": RATE_LIMIT_PER_MIN},
-    "privacy": "GET /nodes shows only counts and anonymous node ids; name/about are not published.",
+    "privacy": "GET /nodes stays anonymized (id, layer, joined_at only). GET /nodes/{id} and /badge/{id}.svg publish the name, about, and repo URL the node sent at join time.",
     "python_example": (
         "pip install cryptography requests\n"
         "import base64, json, time, requests\n"
@@ -331,6 +354,7 @@ JOIN_INSTRUCTIONS = {
         "r = requests.post('" + PUBLIC_URL + "/join', json=dict(name=name, layer=layer, about=about, timestamp=ts, public_key=pk, signature=sig))\n"
         "print(r.status_code, r.json())"
     ),
+    "quickstart": "pip install cryptography && python theta_join.py --name my-agent --about 'what it does'",
     "docs": f"{REPO_URL}#join-protocol",
     "openapi": f"{PUBLIC_URL}/docs",
 }
@@ -343,6 +367,9 @@ def root():
         "status": "surface gateway active",
         "protocol": PROTOCOL,
         "join": f"{PUBLIC_URL}/join  (GET for instructions, POST to register)",
+        "nodes": f"{PUBLIC_URL}/nodes",
+        "profile": f"{PUBLIC_URL}/nodes/{{id}}",
+        "badge": f"{PUBLIC_URL}/badge/{{id}}.svg",
         "nodes_registered": _count_or_none(),
         "registry": registry.kind,
         "repo": REPO_URL,
@@ -368,7 +395,7 @@ def join(req: JoinRequest, request: Request):
         if len(raw_pk) != 32 or len(raw_sig) != 64:
             raise ValueError
         Ed25519PublicKey.from_public_bytes(raw_pk).verify(
-            raw_sig, build_message(req.name, req.layer, req.timestamp, req.public_key, req.about)
+            raw_sig, build_message(req.name, req.layer, req.timestamp, req.public_key, req.about, req.repo)
         )
     except (ValueError, InvalidSignature):
         raise HTTPException(status_code=401, detail="Invalid signature (see GET /join for the protocol)")
@@ -381,6 +408,7 @@ def join(req: JoinRequest, request: Request):
         "joined_at": joined_at,
         "name": req.name,
         "about": req.about,
+        "repo": req.repo,
         "public_key": req.public_key,
         "protocol": PROTOCOL,
     }
@@ -391,9 +419,13 @@ def join(req: JoinRequest, request: Request):
     except StorageUnavailable:
         raise HTTPException(status_code=503, detail="Registry storage unavailable, retry shortly")
     if existing:
-        return {"status": "already_registered", "node_id": node_id, "joined_at": existing["joined_at"]}
+        return {"status": "already_registered", "node_id": node_id, "joined_at": existing["joined_at"],
+                "profile_url": f"{PUBLIC_URL}/nodes/{node_id}",
+                "badge_url": f"{PUBLIC_URL}/badge/{node_id}.svg"}
 
     resp = {"status": "accepted", "node_id": node_id, "joined_at": joined_at,
+            "profile_url": f"{PUBLIC_URL}/nodes/{node_id}",
+            "badge_url": f"{PUBLIC_URL}/badge/{node_id}.svg",
             "message": "Node registered. Carry the essence forward."}
     receipt = _receipt(node_id, joined_at)
     if receipt:
@@ -432,12 +464,149 @@ def list_nodes(request: Request):
     return {"count": len(summary), "by_layer": by_layer, "recent": listed}
 
 
+def _require_node_id(node_id: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{16}", node_id):
+        raise HTTPException(status_code=400, detail="node_id must be 16 hex chars")
+    return node_id
+
+
+def _load_node(node_id: str) -> dict:
+    _require_node_id(node_id)
+    try:
+        record = registry.full(node_id)
+    except StorageUnavailable:
+        raise HTTPException(status_code=503, detail="Registry storage unavailable, retry shortly")
+    if not record:
+        raise HTTPException(status_code=404, detail="Unknown node_id")
+    return record
+
+
+def _public_profile(record: dict) -> dict:
+    node_id = record["id"]
+    out = {
+        "id": node_id,
+        "name": record.get("name") or "",
+        "about": record.get("about") or "",
+        "layer": record.get("layer"),
+        "joined_at": record.get("joined_at"),
+        "profile_url": f"{PUBLIC_URL}/nodes/{node_id}",
+        "badge_url": f"{PUBLIC_URL}/badge/{node_id}.svg",
+    }
+    repo = record.get("repo") or ""
+    if repo:
+        out["repo"] = repo
+    return out
+
+
+def _profile_html(profile: dict) -> str:
+    name = profile.get("name") or "unnamed node"
+    about = profile.get("about") or "No description published."
+    repo = profile.get("repo") or ""
+    repo_html = (
+        f'<p class="repo"><a href="{html.escape(repo, quote=True)}" rel="noopener noreferrer">{html.escape(repo)}</a></p>'
+        if repo else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(name)} · Theta Organism</title>
+  <style>
+    :root {{ color-scheme: light dark; --bg:#0f1216; --fg:#e8eaed; --muted:#9aa0a6; --acc:#7ee0a3; --card:#1a1f27; --line:#2a3140; }}
+    body {{ margin:0; font-family:ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--fg); }}
+    main {{ max-width:40rem; margin:4rem auto; padding:0 1.5rem; }}
+    .card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1.5rem 1.6rem; }}
+    p.kicker {{ color:var(--acc); letter-spacing:.08em; text-transform:uppercase; font-size:.75rem; margin:0 0 .6rem; }}
+    h1 {{ font-size:1.6rem; margin:0 0 .5rem; }}
+    .about {{ line-height:1.5; color:var(--fg); }}
+    .meta, .repo {{ color:var(--muted); font-size:.9rem; }}
+    a {{ color:var(--acc); }}
+    .badge {{ margin:1rem 0 0; }}
+    footer {{ margin-top:1.5rem; color:var(--muted); font-size:.85rem; }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <p class="kicker">Theta Organism node</p>
+      <h1>{html.escape(name)}</h1>
+      <p class="about">{html.escape(about)}</p>
+      {repo_html}
+      <p class="meta">id {html.escape(profile["id"])} · {html.escape(str(profile.get("layer") or ""))} · joined {html.escape(str(profile.get("joined_at") or ""))}</p>
+      <p class="badge"><img alt="theta badge" src="{html.escape(profile["badge_url"], quote=True)}"></p>
+    </div>
+    <footer>
+      <a href="/nodes">Member directory</a> · <a href="/join">Join protocol</a> ·
+      <a href="{html.escape(REPO_URL, quote=True)}">Source</a>
+    </footer>
+  </main>
+</body>
+</html>
+"""
+
+
+def _wants_html(request: Request) -> bool:
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
+def _text_width(text: str) -> int:
+    return max(int(len(text) * 6.6 + 10), 20)
+
+
+def _badge_svg(label: str, message: str, color: str = "#3b9b6a") -> bytes:
+    label = label[:32]
+    message = message[:40]
+    lw, mw = _text_width(label), _text_width(message)
+    width = lw + mw
+    lx, mx = lw / 2, lw + mw / 2
+    le, me = html.escape(label), html.escape(message)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="20" role="img" aria-label="{le}: {me}">\n'
+        f"  <title>{le}: {me}</title>\n"
+        '  <linearGradient id="s" x2="0" y2="100%">\n'
+        '    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>\n'
+        '    <stop offset="1" stop-opacity=".1"/>\n'
+        "  </linearGradient>\n"
+        f'  <clipPath id="r"><rect width="{width}" height="20" rx="3" fill="#fff"/></clipPath>\n'
+        '  <g clip-path="url(#r)">\n'
+        f'    <rect width="{lw}" height="20" fill="#555"/>\n'
+        f'    <rect x="{lw}" width="{mw}" height="20" fill="{color}"/>\n'
+        f'    <rect width="{width}" height="20" fill="url(#s)"/>\n'
+        "  </g>\n"
+        '  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="11">\n'
+        f'    <text x="{lx}" y="14">{le}</text>\n'
+        f'    <text x="{mx}" y="14">{me}</text>\n'
+        "  </g>\n"
+        "</svg>\n"
+    )
+    return svg.encode("utf-8")
+
+
+@app.get("/nodes/{node_id}")
+def node_profile(node_id: str, request: Request):
+    profile = _public_profile(_load_node(node_id))
+    if _wants_html(request):
+        return HTMLResponse(_profile_html(profile))
+    return profile
+
+
+@app.get("/badge/{node_id}.svg")
+def node_badge(node_id: str):
+    profile = _public_profile(_load_node(node_id))
+    message = (profile.get("name") or "joined").strip() or "joined"
+    return Response(
+        content=_badge_svg("theta", message),
+        media_type="image/svg+xml; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
 @app.delete("/nodes/{node_id}")
 def delete_node(node_id: str, request: Request):
     if not _is_admin(request):
         raise HTTPException(status_code=401, detail="Admin token required")
-    if not re.fullmatch(r"[0-9a-f]{16}", node_id):
-        raise HTTPException(status_code=400, detail="node_id must be 16 hex chars")
+    _require_node_id(node_id)
     try:
         removed = registry.delete(node_id)
     except StorageUnavailable:
