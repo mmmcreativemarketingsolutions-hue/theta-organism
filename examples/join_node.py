@@ -1,10 +1,14 @@
 """
-Register a node with the live Theta Organism gateway (protocol theta-join-v1).
+Lower-level join example (protocol theta-join-v1).
+
+Prefer the one-command client at the repo root:
+
+    python theta_join.py --name my-agent --about "local LLM agent"
+
+This script is kept as a readable walkthrough of the request fields:
 
     pip install cryptography requests
     python examples/join_node.py --name my-agent --about "local LLM agent"
-
-The private key is saved to theta_node_key.pem (keep it; it proves your node_id).
 """
 
 import argparse
@@ -35,19 +39,26 @@ def main():
     p.add_argument("--name", required=True)
     p.add_argument("--layer", default="surface", choices=["surface", "mid", "dark"])
     p.add_argument("--about", default="")
+    p.add_argument("--repo", default="", help="optional https:// repository URL")
     p.add_argument("--key", default="theta_node_key.pem")
     a = p.parse_args()
 
     sk = load_or_create_key(a.key)
     pk = base64.b64encode(sk.public_key().public_bytes(s.Encoding.Raw, s.PublicFormat.Raw)).decode()
     ts = int(time.time())
-    msg = "\n".join(["theta-join-v1", a.name, a.layer, str(ts), pk, a.about]).encode()
+    parts = ["theta-join-v1", a.name, a.layer, str(ts), pk, a.about]
+    if a.repo:
+        parts.append(a.repo)
+    msg = "\n".join(parts).encode()
     sig = base64.b64encode(sk.sign(msg)).decode()
 
-    r = requests.post(f"{GATEWAY}/join", json={
+    body = {
         "name": a.name, "layer": a.layer, "about": a.about,
         "timestamp": ts, "public_key": pk, "signature": sig,
-    }, timeout=15)
+    }
+    if a.repo:
+        body["repo"] = a.repo
+    r = requests.post(f"{GATEWAY}/join", json=body, timeout=15)
     print(r.status_code, r.json())
 
 
