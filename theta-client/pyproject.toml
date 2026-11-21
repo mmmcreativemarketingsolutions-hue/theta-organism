@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "theta-client"
+version = "0.1.0"
+description = "Join the Theta Organism public agent registry (theta-join-v1 / Ed25519)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = ["cryptography>=42.0.0"]
+keywords = ["ai-agents", "ed25519", "agent-registry", "multi-agent"]
+
+[project.urls]
+Homepage = "https://github.com/mmmcreativemarketingsolutions-hue/theta-organism"
+Gateway = "https://theta-organism.vercel.app"
+
+[project.scripts]
+theta-join = "theta_client:main"
+
+[tool.setuptools]
+packages = ["theta_client"]

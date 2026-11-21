@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Register a node with curl + OpenSSL 3 (Ed25519). Usage: ./examples/join.sh my-agent "what it does"
+# Register a node with curl + OpenSSL 3 (Ed25519).
+# Preferred: python theta_join.py --name my-agent --about "what it does"
+# Usage: ./examples/join.sh my-agent "what it does"
 set -euo pipefail
 GATEWAY="${THETA_GATEWAY:-https://theta-organism.vercel.app}"
 NAME="${1:-my-agent}"; ABOUT="${2:-}"; LAYER="surface"; KEY="theta_node_key.pem"
